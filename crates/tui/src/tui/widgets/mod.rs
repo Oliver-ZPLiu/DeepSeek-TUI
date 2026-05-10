@@ -326,8 +326,9 @@ impl Renderable for ChatWidget {
             .style(Style::default().bg(self.background))
             .render(area, buf);
 
-        let paragraph =
-            Paragraph::new(self.lines.clone()).style(Style::default().bg(self.background));
+        let paragraph = Paragraph::new(self.lines.clone())
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(self.background));
         paragraph.render(area, buf);
 
         if let Some(scrollbar) = self.scrollbar {

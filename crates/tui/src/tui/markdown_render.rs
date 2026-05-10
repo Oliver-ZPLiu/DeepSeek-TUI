@@ -29,6 +29,7 @@ use std::cell::Cell;
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::palette;
@@ -481,8 +482,26 @@ fn render_line_with_links(
             current_spans = Vec::new();
             current_width = 0;
         }
-        current_spans.push(Span::styled(word, style));
+        current_spans.push(Span::styled(word.clone(), style));
         current_width += ww;
+
+        // Hard-wrap at grapheme boundaries when a single word exceeds width
+        // (e.g. long URLs, code tokens, or base64 strings).
+        if ww > width {
+            // Remove the full word and re-add in width-limited grapheme chunks.
+            current_spans.pop();
+            current_width = current_width.saturating_sub(ww);
+            for grapheme in word.graphemes(true) {
+                let gw = grapheme.width();
+                if current_width + gw > width && !current_spans.is_empty() {
+                    lines.push(Line::from(current_spans));
+                    current_spans = Vec::new();
+                    current_width = 0;
+                }
+                current_spans.push(Span::styled(grapheme.to_string(), style));
+                current_width += gw;
+            }
+        }
     }
 
     if !current_spans.is_empty() {
@@ -907,6 +926,23 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
             }
             current.push_str(word);
             current_width += word_width;
+        }
+
+        // Hard-wrap at grapheme boundaries when a single word exceeds width
+        // (e.g. long URLs, code tokens, or base64 strings).
+        if current_width > width {
+            let remaining = std::mem::take(&mut current);
+            current_width = 0;
+            for grapheme in remaining.graphemes(true) {
+                let gw = grapheme.width();
+                if current_width + gw > width && !current.is_empty() {
+                    lines.push(current);
+                    current = String::new();
+                    current_width = 0;
+                }
+                current.push_str(grapheme);
+                current_width += gw;
+            }
         }
     }
 
