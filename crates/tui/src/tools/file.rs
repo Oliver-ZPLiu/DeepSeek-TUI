@@ -439,6 +439,12 @@ impl ToolSpec for EditFileTool {
         let search = required_str(&input, "search")?;
         let replace = required_str(&input, "replace")?;
 
+        if search == replace {
+            return Err(ToolError::invalid_input(
+                "edit_file: search and replace are identical, no change intended",
+            ));
+        }
+
         let file_path = context.resolve_path(path_str)?;
 
         let contents = fs::read_to_string(&file_path).map_err(|e| {
