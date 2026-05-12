@@ -208,7 +208,7 @@ pub(super) fn ensure_advanced_tooling(catalog: &mut Vec<Tool>, mode: AppMode) {
     }
 }
 
-pub(super) fn initial_active_tools(catalog: &[Tool], mode: AppMode) -> HashSet<String> {
+pub(super) fn initial_active_tools(catalog: &[Tool]) -> HashSet<String> {
     let mut active = HashSet::new();
 
     for tool in catalog {
