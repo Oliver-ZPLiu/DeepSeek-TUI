@@ -2970,8 +2970,13 @@ async fn run_subagent(
         .then_some(runtime.fork_context.as_ref())
         .flatten();
     let request_system = subagent_request_system_prompt(&system_prompt, fork_context);
-    let mut messages =
-        build_initial_subagent_messages(&prompt, &assignment, &agent_type, fork_context, Some(&runtime.context.notes_path));
+    let mut messages = build_initial_subagent_messages(
+        &prompt,
+        &assignment,
+        &agent_type,
+        fork_context,
+        Some(&runtime.context.notes_path),
+    );
     let runtime_for_tools = runtime.clone().with_fork_context(SubAgentForkContext {
         system: Some(request_system.clone()),
         messages: messages.clone(),

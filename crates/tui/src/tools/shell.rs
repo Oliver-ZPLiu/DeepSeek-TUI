@@ -2725,8 +2725,12 @@ impl ToolSpec for NoteTool {
             "kind": kind,
             "inherit": inherit,
         });
-        writeln!(file, "\n---\n{}", serde_json::to_string(&entry).unwrap_or_default())
-            .map_err(|e| ToolError::execution_failed(format!("Failed to write note: {e}")))?;
+        writeln!(
+            file,
+            "\n---\n{}",
+            serde_json::to_string(&entry).unwrap_or_default()
+        )
+        .map_err(|e| ToolError::execution_failed(format!("Failed to write note: {e}")))?;
 
         let inherit_note = if inherit {
             " (inherited by sub-agents)"
