@@ -208,13 +208,30 @@ pub(super) fn ensure_advanced_tooling(catalog: &mut Vec<Tool>, mode: AppMode) {
     }
 }
 
+/// When set, the engine freezes the active tool set at session start so that
+/// `tools_hash` never changes mid-session.  Deferred tool activation is
+/// disabled.
+pub(super) const CACHE_POLICY_STABLE_PREFIX: bool = true;
+
 pub(super) fn initial_active_tools(catalog: &[Tool]) -> HashSet<String> {
     let mut active = HashSet::new();
+
     for tool in catalog {
-        if !tool.defer_loading.unwrap_or(false) || is_tool_search_tool(&tool.name) {
+        // Stable prefix: activate every tool that the mode allows (excluding
+        // tool-search entry points).  The one-time token overhead at session
+        // start is far smaller than the cost of a mid-session tools_hash
+        // change that invalidates the entire KV prefix cache.
+        let activate = if CACHE_POLICY_STABLE_PREFIX {
+            !is_tool_search_tool(&tool.name)
+        } else {
+            !tool.defer_loading.unwrap_or(false) || is_tool_search_tool(&tool.name)
+        };
+
+        if activate {
             active.insert(tool.name.clone());
         }
     }
+
     if active.is_empty()
         && !catalog.is_empty()
         && let Some(first) = catalog.first()
@@ -423,6 +440,13 @@ pub(super) fn maybe_activate_requested_deferred_tool(
     catalog: &[Tool],
     active_tools: &mut HashSet<String>,
 ) -> bool {
+    // Stable prefix mode: all tools were activated at session start.
+    // Mid-session activation would change tools_hash and destroy the
+    // KV prefix cache from the tools position onwards.
+    if CACHE_POLICY_STABLE_PREFIX {
+        return false;
+    }
+
     let Some(def) = catalog.iter().find(|def| def.name == tool_name) else {
         return false;
     };
