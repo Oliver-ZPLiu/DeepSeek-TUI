@@ -28,7 +28,7 @@ impl Engine {
         if !tool_catalog.is_empty() {
             ensure_advanced_tooling(&mut tool_catalog, mode);
         }
-        let mut active_tool_names = initial_active_tools(&tool_catalog);
+        let mut active_tool_names = initial_active_tools(&tool_catalog, mode);
         let mut loop_guard = LoopGuard::default();
 
         // Transparent stream-retry counter: when the chunked-transfer

@@ -345,7 +345,7 @@ fn quick_plan_turn_can_narrow_first_step_tools_to_update_plan() {
             cache_control: None,
         },
     ];
-    let active = initial_active_tools(&catalog);
+    let active = initial_active_tools(&catalog, AppMode::Agent);
 
     let forced = active_tools_for_step(&catalog, &active, true);
     assert_eq!(forced.len(), 1);
@@ -1685,7 +1685,7 @@ fn tool_search_activates_discovered_deferred_tools() {
         },
     ];
     ensure_advanced_tooling(&mut catalog, AppMode::Agent);
-    let mut active = initial_active_tools(&catalog);
+    let mut active = initial_active_tools(&catalog, AppMode::Agent);
     let result = execute_tool_search(
         TOOL_SEARCH_BM25_NAME,
         &json!({"query":"read file"}),

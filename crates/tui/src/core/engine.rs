@@ -1754,7 +1754,7 @@ impl Engine {
         // Drop any compaction summary — that path is incompatible with the
         // fresh-context model and would Frankenstein-merge with the briefing.
         self.session.compaction_summary_prompt = None;
-        self.refresh_system_prompt(mode);
+        self.refresh_system_prompt_forced(mode);
         self.emit_session_updated().await;
 
         let _ = self
@@ -1781,11 +1781,22 @@ impl Engine {
     /// Dynamic workspace context is delivered separately through request-local
     /// `workspace_delta` blocks appended to the latest user message so that
     /// only the tail of the request changes — the stable prefix stays intact.
+    ///
+    /// Pass `force: true` to rebuild unconditionally (cycle-forward, mode
+    /// switch, explicit reset).
     fn refresh_system_prompt(&mut self, mode: AppMode) {
+        self.refresh_system_prompt_inner(mode, false)
+    }
+
+    fn refresh_system_prompt_forced(&mut self, mode: AppMode) {
+        self.refresh_system_prompt_inner(mode, true)
+    }
+
+    fn refresh_system_prompt_inner(&mut self, mode: AppMode, force: bool) {
         // Only build once per session.  Subsequent engine steps must not
         // replace the prompt because even a single-byte difference destroys
         // the entire KV prefix cache from byte 0 onwards.
-        if self.session.system_prompt.is_some() {
+        if self.session.system_prompt.is_some() && !force {
             return;
         }
 
