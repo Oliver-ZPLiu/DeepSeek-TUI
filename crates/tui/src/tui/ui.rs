@@ -2020,6 +2020,15 @@ async fn run_event_loop(
             if app.use_mouse_capture
                 && let Event::Mouse(mouse) = evt
             {
+                // During streaming, discard mouse movement/drag events
+                // to prevent them from flooding the input buffer
+                // and appearing as "auto-typed" garbage (#1529).
+                if app.is_loading
+                    && (matches!(mouse.kind, MouseEventKind::Moved)
+                        || matches!(mouse.kind, MouseEventKind::Drag(_)))
+                {
+                    continue;
+                }
                 let events = handle_mouse_event(app, mouse);
                 if handle_view_events(
                     terminal,
