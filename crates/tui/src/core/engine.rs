@@ -1773,8 +1773,22 @@ impl Engine {
             .await;
     }
 
-    /// Refresh the system prompt based on current mode and context.
+    /// Build a stable system prompt for the current mode (without transient
+    /// project-context / workspace-state content that would invalidate the
+    /// DeepSeek prefix cache every turn).
+    ///
+    /// Once set, the prompt is kept immutable for the lifetime of the session.
+    /// Dynamic workspace context is delivered separately through request-local
+    /// `workspace_delta` blocks appended to the latest user message so that
+    /// only the tail of the request changes — the stable prefix stays intact.
     fn refresh_system_prompt(&mut self, mode: AppMode) {
+        // Only build once per session.  Subsequent engine steps must not
+        // replace the prompt because even a single-byte difference destroys
+        // the entire KV prefix cache from byte 0 onwards.
+        if self.session.system_prompt.is_some() {
+            return;
+        }
+
         let user_memory_block =
             crate::memory::compose_block(self.config.memory_enabled, &self.config.memory_path);
         let base = prompts::system_prompt_for_mode_with_context_skills_session_and_approval(
@@ -1786,7 +1800,11 @@ impl Engine {
             prompts::PromptSessionContext {
                 user_memory_block: user_memory_block.as_deref(),
                 goal_objective: self.config.goal_objective.as_deref(),
-                project_context_pack_enabled: self.config.project_context_pack_enabled,
+                // Exclude project-context pack from the stable system prompt.
+                // Project / workspace state is per-turn transient content and
+                // is instead delivered as a request-local `<workspace_delta>`
+                // block appended to the latest user message.
+                project_context_pack_enabled: false,
                 locale_tag: &self.config.locale_tag,
                 translation_enabled: self.config.translation_enabled,
             },
@@ -1795,10 +1813,8 @@ impl Engine {
         let stable_prompt =
             merge_system_prompts(Some(&base), self.session.compaction_summary_prompt.clone());
         let stable_hash = system_prompt_hash(stable_prompt.as_ref());
-        if self.session.last_system_prompt_hash != Some(stable_hash) {
-            self.session.system_prompt = stable_prompt;
-            self.session.last_system_prompt_hash = Some(stable_hash);
-        }
+        self.session.system_prompt = stable_prompt;
+        self.session.last_system_prompt_hash = Some(stable_hash);
     }
 
     fn merge_compaction_summary(&mut self, summary_prompt: Option<SystemPrompt>) {

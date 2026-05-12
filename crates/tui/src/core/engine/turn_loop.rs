@@ -1915,8 +1915,70 @@ impl Engine {
         // appended. Do not rewrite historical messages at request time: doing
         // so makes the API prefix differ from the bytes sent in earlier turns
         // and destroys DeepSeek's KV prefix cache reuse.
-        self.session.messages.clone()
+        let mut messages = self.session.messages.clone();
+
+        // Append request-local workspace delta as a transient block on the
+        // last user message so the model sees the latest file/git/command
+        // state without destabilizing the cached system prompt prefix.
+        if let Some(delta) =
+            build_workspace_delta(&self.session.working_set, &self.session.workspace)
+        {
+            if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
+                last_user.content.push(ContentBlock::Text {
+                    text: delta,
+                    cache_control: None,
+                });
+            }
+        }
+
+        messages
     }
+}
+
+/// Build a compact, request-local workspace status block for the model.
+///
+/// This replaces project-context content that was previously injected into
+/// the system prompt.  Because the block is appended to the latest user
+/// message rather than placed at the start of the request, only the
+/// trailing portion of the prefix changes — the stable system / tools
+/// prefix stays intact.
+///
+/// The block is **never** persisted into `session.messages`.  Its content
+/// is valid for the current engine step only.
+fn build_workspace_delta(
+    _working_set: &crate::working_set::WorkingSet,
+    workspace: &std::path::Path,
+) -> Option<String> {
+    let mut lines: Vec<String> = Vec::new();
+
+    // Git status (best-effort) — the most impactful transient signal
+    if let Ok(output) = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(workspace)
+        .args(["status", "--porcelain"])
+        .output()
+    {
+        let out = String::from_utf8_lossy(&output.stdout);
+        let trimmed = out.trim();
+        if !trimmed.is_empty() {
+            lines.push("git_status:".to_string());
+            for line in trimmed.lines().take(15) {
+                lines.push(format!("  {line}"));
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    let mut body = String::from("<workspace_delta transient=\"true\">\n");
+    for line in &lines {
+        body.push_str(line);
+        body.push('\n');
+    }
+    body.push_str("</workspace_delta>\n");
+    Some(body)
 }
 
 fn subagent_completion_runtime_message(payload: &str) -> Message {
