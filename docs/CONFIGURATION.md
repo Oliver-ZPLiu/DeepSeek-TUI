@@ -98,6 +98,51 @@ distinct set of commands (`auth`, `config`, `model`, `thread`, `sandbox`,
 `app-server`, `mcp-server`, `completion`) and forwards plain prompts to
 `deepseek-tui`.
 
+## Custom Third-Party API Configuration
+
+To connect to an OpenAI-compatible third-party API (e.g. a proxy gateway or
+self-hosted endpoint), add the following to `~/.deepseek/config.toml`:
+
+```toml
+provider = "openai"
+model = "your-model-name"
+
+[providers.openai]
+api_key = "your-api-key"
+base_url = "https://your-api-url/v1"
+```
+
+**Key points:**
+
+- `provider` must be a preset name (`openai` is the most universal for
+  OpenAI-compatible endpoints).
+- `model` goes at the top level, not inside the provider section.
+- `api_key` and `base_url` go inside `[providers.openai]`.
+
+For a cloud proxy or third-party gateway, use the provider's base URL:
+
+```toml
+provider = "openai"
+model = "deepseek-v4-flash"
+
+[providers.openai]
+api_key = "sk-your-proxy-key"
+base_url = "https://api.example.com/v1"
+```
+
+When `base_url` uses plain `http://`, set
+`DEEPSEEK_ALLOW_INSECURE_HTTP=1` to bypass the insecure-connection guard.
+
+For a local Ollama instance, use the `ollama` provider instead:
+
+```toml
+provider = "ollama"
+model = "deepseek-coder:1.3b"
+```
+
+The `api_key` and `base_url` fields are optional for Ollama; it defaults to
+`http://localhost:11434/v1`.
+
 ## Profiles
 
 You can define multiple profiles in the same file:
