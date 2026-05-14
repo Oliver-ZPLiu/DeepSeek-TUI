@@ -569,6 +569,12 @@ struct StreamableHttpTransport {
     /// runs before each request.
     headers: HashMap<String, String>,
     pending_messages: VecDeque<Vec<u8>>,
+    /// Per-spec MCP session identifier returned by the server in the
+    /// first response (typically the `initialize` response). Attached
+    /// as the `Mcp-Session-Id` header on every subsequent outbound
+    /// request so the server can correlate messages within the same
+    /// session.
+    session_id: Option<String>,
 }
 
 enum StreamableSendError {
@@ -797,6 +803,69 @@ impl HttpTransport {
         self.mode = HttpTransportMode::Sse(sse);
         Ok(())
     }
+
+    /// Best-effort session-establishment GET preflight.
+    ///
+    /// Per the Streamable HTTP spec, the server may return an
+    /// `Mcp-Session-Id` header on the `initialize` response (the normal
+    /// path handled inside [`StreamableHttpTransport::send`] above).
+    /// However some servers (e.g. Hindsight, #1629) **require** a session
+    /// ID on every POST including `initialize`, creating a chicken-and-egg
+    /// problem. For those servers we send a short-lived GET before the
+    /// first POST: if the server returns a session ID in the GET response
+    /// it will be captured by the header-reading code in
+    /// [`StreamableHttpTransport::send`] just as if it came from a POST
+    /// response.
+    ///
+    /// This is intentionally best-effort:
+    /// * The GET uses a tight per-request inner timeout so it never
+    ///   blocks connection startup for long.
+    /// * If the server doesn't support GET (405, 404, …) we log a debug
+    ///   line and move on — the `initialize` POST will proceed without a
+    ///   session ID.
+    /// * If the server opens an SSE stream in response (the GET from old
+    ///   SSE transport), we read only the headers, then discard the body
+    ///   so the SSE stream is torn down. The actual SSE path uses a
+    ///   dedicated `SseTransport` and is triggered by the incompatible-
+    ///   status fallback in [`HttpTransport::send`].
+    async fn try_establish_session(&mut self) -> Result<()> {
+        let transport = match &mut self.mode {
+            HttpTransportMode::Streamable(t) => t,
+            // Already on SSE — session is implicit via the long-lived GET.
+            HttpTransportMode::Sse(_) => return Ok(()),
+        };
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_default_mcp_http_headers(transport.client.get(&transport.url), false).send(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("GET timeout"))?
+        .map_err(|e| anyhow::anyhow!("GET error: {e}"))?;
+
+        // Capture session ID from the GET response so subsequent POSTs
+        // (including `initialize`) can include it. This is the same
+        // header-reading logic that would be hit inside
+        // `StreamableHttpTransport::send` for POST responses, but since
+        // the GET is sent before any POST we do it here directly.
+        if let Some(sid) = response
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|v| v.to_str().ok())
+        {
+            if transport.session_id.as_deref() != Some(sid) {
+                tracing::debug!(target: "mcp", session_id = %sid, "captured MCP session ID via GET preflight");
+                transport.session_id = Some(sid.to_string());
+            }
+        }
+
+        // We only care about the response headers — discard the body.
+        // If the server opened an SSE stream in response (some servers
+        // do this on GET), it will be torn down when response is dropped.
+        drop(response);
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -839,6 +908,7 @@ impl StreamableHttpTransport {
             url,
             headers,
             pending_messages: VecDeque::new(),
+            session_id: None,
         }
     }
 
@@ -866,6 +936,12 @@ impl StreamableHttpTransport {
             }
             request = request.header(key.as_str(), value.as_str());
         }
+        // Attach any previously captured session ID per the Streamable
+        // HTTP spec so the server can correlate this request to the
+        // existing session.
+        if let Some(ref sid) = self.session_id {
+            request = request.header("Mcp-Session-Id", sid.as_str());
+        }
         let response = request
             .body(msg)
             .send()
@@ -873,6 +949,20 @@ impl StreamableHttpTransport {
             .map_err(|err| StreamableSendError::Other(err.into()))?;
 
         let status = response.status();
+
+        // Capture session ID from any response (2xx, 202, 4xx, …). The
+        // server may return it on the `initialize` response or on a
+        // best-effort GET preflight below.
+        if let Some(sid) = response
+            .headers()
+            .get("Mcp-Session-Id")
+            .and_then(|v| v.to_str().ok())
+        {
+            if self.session_id.as_deref() != Some(sid) {
+                tracing::debug!(target: "mcp", session_id = %sid, "captured MCP session ID");
+                self.session_id = Some(sid.to_string());
+            }
+        }
         if status == StatusCode::ACCEPTED || status == StatusCode::NO_CONTENT {
             return Ok(());
         }
@@ -1113,13 +1203,27 @@ impl McpConnection {
                 }
             }
             let client = client_builder.build()?;
-            Box::new(HttpTransport::new(
+            let mut http = HttpTransport::new(
                 client,
                 url.clone(),
                 config.headers.clone(),
                 cancel_token.clone(),
                 Duration::from_secs(connect_timeout_secs),
-            ))
+            );
+            // Best-effort session preflight for servers that require
+            // a session ID on every POST including `initialize`
+            // (e.g. Hindsight, #1629). Failures are non-fatal — the
+            // `initialize` POST will proceed and may capture a session
+            // ID from the response instead.
+            if let Err(e) = http.try_establish_session().await {
+                tracing::debug!(
+                    target: "mcp",
+                    server = %name,
+                    error = %e,
+                    "session-establishment GET skipped; proceeding with POST initialize"
+                );
+            }
+            Box::new(http)
         } else if let Some(command) = &config.command {
             let mut cmd = tokio::process::Command::new(command);
             cmd.args(&config.args)
