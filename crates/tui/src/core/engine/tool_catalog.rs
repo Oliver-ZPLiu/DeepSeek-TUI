@@ -29,16 +29,17 @@ pub(super) fn is_tool_search_tool(name: &str) -> bool {
     matches!(name, TOOL_SEARCH_REGEX_NAME | TOOL_SEARCH_BM25_NAME)
 }
 
-pub(super) fn should_default_defer_tool(name: &str, mode: AppMode) -> bool {
-    if mode == AppMode::Yolo {
-        return false;
-    }
-
+/// Returns true for tools that form the agent's core action surface:
+/// read, edit, write, shell exec, todo, notifications, user input, etc.
+/// These tools are always loaded at session start and must never change
+/// mid-session — otherwise the cached KV prefix becomes invalid when
+/// `tools_hash` changes.
+pub(super) fn is_main_path_tool(name: &str, mode: AppMode) -> bool {
     // Shell exec tools are kept active in Agent so the model can run
     // verification commands (build/test/git/cargo) without first having to
     // discover them through ToolSearch. Plan mode does not register shell
     // execution tools.
-    let always_loaded_in_action_modes = matches!(mode, AppMode::Agent)
+    if matches!(mode, AppMode::Agent)
         && matches!(
             name,
             "exec_shell"
@@ -46,12 +47,12 @@ pub(super) fn should_default_defer_tool(name: &str, mode: AppMode) -> bool {
                 | "exec_shell_interact"
                 | "exec_wait"
                 | "exec_interact"
-        );
-    if always_loaded_in_action_modes {
-        return false;
+        )
+    {
+        return true;
     }
 
-    !matches!(
+    matches!(
         name,
         "read_file"
             | "list_dir"
@@ -63,6 +64,8 @@ pub(super) fn should_default_defer_tool(name: &str, mode: AppMode) -> bool {
             | "rlm_configure"
             | "rlm_close"
             | "handle_read"
+            | "edit_file"
+            | "write_file"
             | "recall_archive"
             | "notify"
             | MULTI_TOOL_PARALLEL_NAME
@@ -79,6 +82,13 @@ pub(super) fn should_default_defer_tool(name: &str, mode: AppMode) -> bool {
             | "github_pr_context"
             | REQUEST_USER_INPUT_NAME
     )
+}
+
+pub(super) fn should_default_defer_tool(name: &str, mode: AppMode) -> bool {
+    if mode == AppMode::Yolo {
+        return false;
+    }
+    !is_main_path_tool(name, mode)
 }
 
 pub(super) fn apply_native_tool_deferral(catalog: &mut [Tool], mode: AppMode) {
@@ -462,8 +472,21 @@ pub(super) fn maybe_hydrate_requested_deferred_tool(
     catalog: &[Tool],
     active_tools_at_batch_start: &HashSet<String>,
     hydrated_tools_this_batch: &mut HashSet<String>,
+    mode: AppMode,
 ) -> Option<ToolResult> {
     let def = catalog.iter().find(|def| def.name == tool_name)?;
+
+    // Invariant guard: main-path tools must never be deferred. If one
+    // is accidentally marked defer_loading = true, skip hydration so we
+    // don't change tools_hash mid-session and break the prefix cache.
+    // The tool will execute normally — the model already knows its schema.
+    if is_main_path_tool(tool_name, mode) && def.defer_loading.unwrap_or(false) {
+        crate::logging::warn(format!(
+            "main-path tool '{tool_name}' is unexpectedly deferred; \
+             skipping hydration to keep tools_hash stable (invariant violation)"
+        ));
+        return None;
+    }
 
     if !def.defer_loading.unwrap_or(false) || active_tools_at_batch_start.contains(tool_name) {
         return None;

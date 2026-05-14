@@ -1192,6 +1192,7 @@ impl Engine {
                         &tool_catalog,
                         &active_tools_at_batch_start,
                         &mut deferred_tools_hydrated_this_batch,
+                        mode,
                     )
                 {
                     if should_emit_hydration_status {
@@ -1922,13 +1923,12 @@ impl Engine {
         // state without destabilizing the cached system prompt prefix.
         if let Some(delta) =
             build_workspace_delta(&self.session.working_set, &self.session.workspace)
+            && let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user")
         {
-            if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
-                last_user.content.push(ContentBlock::Text {
-                    text: delta,
-                    cache_control: None,
-                });
-            }
+            last_user.content.push(ContentBlock::Text {
+                text: delta,
+                cache_control: None,
+            });
         }
 
         messages

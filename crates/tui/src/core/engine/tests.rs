@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::engine::tool_catalog::{apply_native_tool_deferral, initial_active_tools};
 
 use crate::models::SystemBlock;
 use crate::test_support::lock_test_env;
@@ -434,44 +435,39 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
 }
 
 #[test]
-fn deferred_edit_file_first_use_hydrates_schema_without_execution() {
-    let mut edit = api_tool("edit_file");
-    edit.defer_loading = Some(true);
-    edit.input_schema = json!({
+fn deferred_non_main_path_tool_hydrates_schema_without_execution() {
+    // Use project_map — it's not in is_main_path_tool so it stays deferred.
+    let mut project_map = api_tool("project_map");
+    project_map.defer_loading = Some(true);
+    project_map.input_schema = json!({
         "type": "object",
         "properties": {
             "path": { "type": "string" },
-            "search": { "type": "string" },
-            "replace": { "type": "string" }
+            "query": { "type": "string" }
         },
-        "required": ["path", "search", "replace"]
+        "required": ["path"]
     });
 
-    let catalog = vec![edit];
+    let catalog = vec![project_map];
     let active_at_batch_start = HashSet::new();
     let mut hydrated_this_batch = HashSet::new();
     let result = maybe_hydrate_requested_deferred_tool(
-        "edit_file",
+        "project_map",
         &json!({
-            "path": "src/foo.rs",
-            "old_string": "before",
-            "new_string": "after"
+            "path": "src",
+            "query": "main"
         }),
         &catalog,
         &active_at_batch_start,
         &mut hydrated_this_batch,
+        AppMode::Agent,
     )
-    .expect("first deferred use should hydrate");
+    .expect("first deferred use of non-main-path tool should hydrate");
 
-    assert!(!active_at_batch_start.contains("edit_file"));
-    assert!(hydrated_this_batch.contains("edit_file"));
+    assert!(!active_at_batch_start.contains("project_map"));
+    assert!(hydrated_this_batch.contains("project_map"));
     assert!(result.success);
-    assert!(result.content.contains("Tool `edit_file` was deferred"));
-    assert!(result.content.contains("path: string"));
-    assert!(result.content.contains("search: string"));
-    assert!(result.content.contains("replace: string"));
-    assert!(result.content.contains("old_string -> search"));
-    assert!(result.content.contains("new_string -> replace"));
+    assert!(result.content.contains("Tool `project_map` was deferred"));
     assert!(result.content.contains("The tool was not executed"));
 
     let metadata = result.metadata.expect("metadata");
@@ -480,11 +476,12 @@ fn deferred_edit_file_first_use_hydrates_schema_without_execution() {
     assert_eq!(metadata["retry_required"], true);
 
     let second_result = maybe_hydrate_requested_deferred_tool(
-        "edit_file",
-        &json!({"path": "src/bar.rs", "old_string": "before", "new_string": "after"}),
+        "project_map",
+        &json!({"path": "src", "query": "test"}),
         &catalog,
         &active_at_batch_start,
         &mut hydrated_this_batch,
+        AppMode::Agent,
     )
     .expect("later calls in the same batch should hydrate instead of executing");
     assert_eq!(second_result.metadata.unwrap()["executed"], false);
@@ -495,14 +492,97 @@ fn deferred_edit_file_first_use_hydrates_schema_without_execution() {
     let mut hydrated_next_batch = HashSet::new();
     assert!(
         maybe_hydrate_requested_deferred_tool(
-            "edit_file",
-            &json!({"path": "src/foo.rs", "search": "before", "replace": "after"}),
+            "project_map",
+            &json!({"path": "src", "query": "main"}),
             &catalog,
             &active_next_batch,
             &mut hydrated_next_batch,
+            AppMode::Agent,
         )
         .is_none(),
         "tools hydrated in a previous batch should execute normally"
+    );
+}
+
+#[test]
+fn deferred_main_path_tool_does_not_hydrate() {
+    // Even if accidentally marked defer_loading = true, a main-path tool
+    // must never hydrate mid-session — hydration changes tools_hash and
+    // breaks the prefix cache.  The invariant guard logs a warning and
+    // returns None so the tool executes normally instead.
+    let mut edit = api_tool("edit_file");
+    edit.defer_loading = Some(true);
+    edit.input_schema = json!({
+        "type": "object",
+        "properties": {
+            "path": {"type": "string"},
+            "search": {"type": "string"},
+            "replace": {"type": "string"}
+        },
+        "required": ["path", "search", "replace"]
+    });
+
+    let catalog = vec![edit];
+    let active_at_batch_start = HashSet::new();
+    let mut hydrated_this_batch = HashSet::new();
+    let result = maybe_hydrate_requested_deferred_tool(
+        "edit_file",
+        &json!({"path": "src/foo.rs", "search": "before", "replace": "after"}),
+        &catalog,
+        &active_at_batch_start,
+        &mut hydrated_this_batch,
+        AppMode::Agent,
+    );
+
+    assert!(result.is_none(), "main-path tool must not hydrate");
+    assert!(
+        hydrated_this_batch.is_empty(),
+        "must not add to hydrated set"
+    );
+}
+
+#[test]
+fn main_path_tools_not_deferred_in_agent_mode() {
+    let mut catalog = vec![
+        api_tool("edit_file"),
+        api_tool("write_file"),
+        api_tool("project_map"), // non-main-path, should stay deferred
+    ];
+    apply_native_tool_deferral(&mut catalog, AppMode::Agent);
+    for tool in &catalog {
+        match tool.name.as_str() {
+            "edit_file" | "write_file" => {
+                assert_eq!(
+                    tool.defer_loading,
+                    Some(false),
+                    "main-path tool '{}' must not be deferred",
+                    tool.name
+                );
+            }
+            "project_map" => {
+                assert_eq!(
+                    tool.defer_loading,
+                    Some(true),
+                    "non-main-path tool 'project_map' should stay deferred"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn main_path_tools_in_initial_active_set() {
+    let mut catalog = vec![api_tool("edit_file"), api_tool("write_file")];
+    apply_native_tool_deferral(&mut catalog, AppMode::Agent);
+    let active = initial_active_tools(&catalog);
+    assert!(
+        active.contains("edit_file"),
+        "edit_file must be in initial active set"
+    );
+    assert!(
+        active.contains("write_file"),
+        "write_file must be in initial active set"
     );
 }
 
