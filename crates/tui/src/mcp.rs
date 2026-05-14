@@ -577,6 +577,7 @@ struct StreamableHttpTransport {
     session_id: Option<String>,
 }
 
+#[derive(Debug)]
 enum StreamableSendError {
     Incompatible(String),
     Other(anyhow::Error),
@@ -835,13 +836,23 @@ impl HttpTransport {
             HttpTransportMode::Sse(_) => return Ok(()),
         };
 
-        let response = tokio::time::timeout(
-            Duration::from_secs(5),
-            with_default_mcp_http_headers(transport.client.get(&transport.url), false).send(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("GET timeout"))?
-        .map_err(|e| anyhow::anyhow!("GET error: {e}"))?;
+        let mut request = transport.client.get(&transport.url);
+        request = with_default_mcp_http_headers(request, false);
+        for (key, value) in &transport.headers {
+            if !is_safe_custom_header(key, value) {
+                tracing::warn!(
+                    target: "mcp",
+                    "skipping unsafe MCP header {:?} (empty/control-char/reserved)",
+                    key
+                );
+                continue;
+            }
+            request = request.header(key.as_str(), value.as_str());
+        }
+        let response = tokio::time::timeout(Duration::from_secs(5), request.send())
+            .await
+            .map_err(|_| anyhow::anyhow!("GET timeout"))?
+            .map_err(|e| anyhow::anyhow!("GET error: {e}"))?;
 
         // Capture session ID from the GET response so subsequent POSTs
         // (including `initialize`) can include it. This is the same
@@ -852,11 +863,10 @@ impl HttpTransport {
             .headers()
             .get("Mcp-Session-Id")
             .and_then(|v| v.to_str().ok())
+            && transport.session_id.as_deref() != Some(sid)
         {
-            if transport.session_id.as_deref() != Some(sid) {
-                tracing::debug!(target: "mcp", session_id = %sid, "captured MCP session ID via GET preflight");
-                transport.session_id = Some(sid.to_string());
-            }
+            tracing::debug!(target: "mcp", session_id = %sid, "captured MCP session ID via GET preflight");
+            transport.session_id = Some(sid.to_string());
         }
 
         // We only care about the response headers — discard the body.
@@ -957,11 +967,10 @@ impl StreamableHttpTransport {
             .headers()
             .get("Mcp-Session-Id")
             .and_then(|v| v.to_str().ok())
+            && self.session_id.as_deref() != Some(sid)
         {
-            if self.session_id.as_deref() != Some(sid) {
-                tracing::debug!(target: "mcp", session_id = %sid, "captured MCP session ID");
-                self.session_id = Some(sid.to_string());
-            }
+            tracing::debug!(target: "mcp", session_id = %sid, "captured MCP session ID");
+            self.session_id = Some(sid.to_string());
         }
         if status == StatusCode::ACCEPTED || status == StatusCode::NO_CONTENT {
             return Ok(());
@@ -2721,6 +2730,7 @@ pub fn format_tool_result(result: &serde_json::Value) -> String {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -3867,5 +3877,143 @@ mod tests {
 
         cancel_token.cancel();
         server.abort();
+    }
+
+    #[test]
+    fn session_id_starts_none() {
+        let transport = StreamableHttpTransport::new(
+            reqwest::Client::new(),
+            "https://example.invalid/mcp".to_string(),
+            HashMap::new(),
+        );
+        assert!(transport.session_id.is_none());
+    }
+
+    /// Session ID captured from a POST response is replayed on the next POST.
+    #[tokio::test]
+    async fn session_id_captured_from_post_response_and_replayed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("POST "), "expected POST, got: {req}");
+
+            // First POST: return a session ID so the transport captures it.
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sess-abc-123\r\nContent-Length: 2\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+            socket.flush().await.unwrap();
+
+            // Read the second POST — should contain the session ID.
+            let mut buf2 = [0u8; 4096];
+            let n2 = socket.read(&mut buf2).await.unwrap();
+            let req2 = String::from_utf8_lossy(&buf2[..n2]);
+            // reqwest lower-cases header names.
+            let req2_lower = req2.to_lowercase();
+            assert!(
+                req2_lower.contains("mcp-session-id: sess-abc-123"),
+                "second POST must replay captured session ID, got:\n{req2}"
+            );
+
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/mcp");
+        let mut transport = StreamableHttpTransport::new(client, url, HashMap::new());
+
+        // First send: server returns Mcp-Session-Id.
+        transport
+            .send(json_frame(serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "initialize",
+                "params": {}
+            })))
+            .await
+            .unwrap();
+        assert_eq!(
+            transport.session_id.as_deref(),
+            Some("sess-abc-123"),
+            "session ID should be captured from response"
+        );
+
+        // Second send: should replay the session ID.
+        transport
+            .send(json_frame(serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "method": "tools/list",
+                "params": {}
+            })))
+            .await
+            .unwrap();
+
+        server.abort();
+    }
+
+    /// Custom headers configured in McpServerConfig are applied to the GET
+    /// preflight so servers that require auth on session-establishment GET
+    /// (e.g. Hindsight, #1629) can authenticate it.
+    #[tokio::test]
+    async fn custom_headers_applied_to_get_preflight() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // The test signals success by writing to this flag — the GET handler
+        // sets it when it sees the expected header.
+        let header_seen = Arc::new(AtomicBool::new(false));
+        let header_seen_srv = Arc::clone(&header_seen);
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+
+            // reqwest lower-cases header names.
+            if req.starts_with("GET ") && req.to_lowercase().contains("x-custom-auth: my-test-token") {
+                header_seen_srv.store(true, AtomicOrdering::SeqCst);
+            }
+
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/mcp");
+        let mut headers = HashMap::new();
+        headers.insert("X-Custom-Auth".to_string(), "my-test-token".to_string());
+
+        let mut transport = HttpTransport::new(
+            client,
+            url,
+            headers,
+            tokio_util::sync::CancellationToken::new(),
+            Duration::from_secs(10),
+        );
+
+        transport.try_establish_session().await.unwrap();
+
+        server.abort();
+
+        assert!(
+            header_seen.load(AtomicOrdering::SeqCst),
+            "GET preflight must include user-configured custom headers"
+        );
     }
 }
