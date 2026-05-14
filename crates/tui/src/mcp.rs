@@ -3984,7 +3984,9 @@ mod tests {
             let req = String::from_utf8_lossy(&buf[..n]);
 
             // reqwest lower-cases header names.
-            if req.starts_with("GET ") && req.to_lowercase().contains("x-custom-auth: my-test-token") {
+            if req.starts_with("GET ")
+                && req.to_lowercase().contains("x-custom-auth: my-test-token")
+            {
                 header_seen_srv.store(true, AtomicOrdering::SeqCst);
             }
 
