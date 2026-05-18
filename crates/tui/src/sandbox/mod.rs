@@ -46,6 +46,77 @@ use std::time::Duration;
 
 pub use policy::SandboxPolicy;
 
+/// The shell to use when interpreting a shell command.
+///
+/// `Auto` picks the platform default (`cmd` on Windows, `sh` on Unix).
+/// Explicit choices let the model declare intent and let the executor
+/// validate availability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShellKind {
+    #[default]
+    Auto,
+    Sh,
+    Bash,
+    Zsh,
+    Cmd,
+    Powershell,
+    Pwsh,
+}
+
+impl ShellKind {
+    pub const VARIANTS: &'static [&'static str] =
+        &["auto", "sh", "bash", "zsh", "cmd", "powershell", "pwsh"];
+
+    /// Resolve this shell kind into (program, args) for the given command.
+    pub fn resolve(self, command: &str) -> (&'static str, Vec<String>) {
+        match self {
+            ShellKind::Auto => Self::auto(command),
+            ShellKind::Sh => ("sh", vec!["-c".to_string(), command.to_string()]),
+            ShellKind::Bash => ("bash", vec!["-lc".to_string(), command.to_string()]),
+            ShellKind::Zsh => ("zsh", vec!["-lc".to_string(), command.to_string()]),
+            ShellKind::Cmd => (
+                "cmd",
+                vec!["/C".to_string(), format!("chcp 65001 >NUL & {command}")],
+            ),
+            ShellKind::Powershell => (
+                "powershell.exe",
+                vec![
+                    "-NoLogo".to_string(),
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-Command".to_string(),
+                    command.to_string(),
+                ],
+            ),
+            ShellKind::Pwsh => (
+                "pwsh",
+                vec![
+                    "-NoLogo".to_string(),
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    command.to_string(),
+                ],
+            ),
+        }
+    }
+
+    /// Platform-default shell: `cmd` on Windows, `sh` on Unix.
+    fn auto(command: &str) -> (&'static str, Vec<String>) {
+        #[cfg(windows)]
+        {
+            (
+                "cmd",
+                vec!["/C".to_string(), format!("chcp 65001 >NUL & {command}")],
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            ("sh", vec!["-c".to_string(), command.to_string()])
+        }
+    }
+}
+
 /// Specification for a command to be executed, potentially within a sandbox.
 ///
 /// This struct captures all the information needed to execute a command:
@@ -77,25 +148,24 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
-    /// Create a `CommandSpec` for running a shell command via the platform shell.
+    /// Create a `CommandSpec` for running a shell command via the platform
+    /// default shell.  Equivalent to `shell_with_kind(…, ShellKind::Auto)`.
     pub fn shell(command: &str, cwd: PathBuf, timeout: Duration) -> Self {
-        #[cfg(windows)]
-        let (program, args) = {
-            // Force UTF-8 output on Windows by running `chcp 65001` before the
-            // actual command. Without this, subprocesses output in the system's
-            // ANSI code page (e.g. GBK for Chinese locales), causing garbled
-            // text in the shell output panel. See issue #982.
-            let cmd = format!("chcp 65001 >NUL & {command}");
-            ("cmd".to_string(), vec!["/C".to_string(), cmd])
-        };
-        #[cfg(not(windows))]
-        let (program, args) = (
-            "sh".to_string(),
-            vec!["-c".to_string(), command.to_string()],
-        );
+        Self::shell_with_kind(command, cwd, timeout, ShellKind::Auto)
+    }
 
+    /// Create a `CommandSpec` for running a shell command with an explicit
+    /// [`ShellKind`].  The shell resolver picks the program and arguments;
+    /// unknown or unavailable shells can be detected at execution time.
+    pub fn shell_with_kind(
+        command: &str,
+        cwd: PathBuf,
+        timeout: Duration,
+        kind: ShellKind,
+    ) -> Self {
+        let (program, args) = kind.resolve(command);
         Self {
-            program,
+            program: program.to_string(),
             args,
             cwd,
             env: HashMap::new(),
@@ -144,21 +214,31 @@ impl CommandSpec {
 
     /// Get the original command as a single string (for display).
     pub fn display_command(&self) -> String {
-        if self.program == "sh" && self.args.len() == 2 && self.args[0] == "-c" {
-            // For shell commands, show the actual command
-            self.args[1].clone()
-        } else if self.program.eq_ignore_ascii_case("cmd")
-            && self.args.len() == 2
-            && self.args[0].eq_ignore_ascii_case("/C")
+        // Shell invocations: unwrap to the raw command string.
+        let is_sh = |prog: &str| prog == "sh" || prog == "bash" || prog == "zsh";
+        let is_cmd = |prog: &str| prog.eq_ignore_ascii_case("cmd");
+        let is_pwsh = |prog: &str| {
+            prog.eq_ignore_ascii_case("powershell.exe") || prog.eq_ignore_ascii_case("pwsh")
+        };
+
+        if is_sh(&self.program)
+            && self.args.len() >= 2
+            && (self.args[0] == "-c" || self.args[0] == "-lc")
         {
-            // Strip the `chcp 65001 >NUL & ` prefix we add on Windows for
-            // UTF-8 output (issue #982).
-            let raw = &self.args[1];
+            self.args.last().expect("-c/-lc command arg").clone()
+        } else if is_cmd(&self.program) && self.args.len() >= 2 && self.args[0] == "/C" {
+            let raw = &self.args.last().expect("/C command arg");
             raw.strip_prefix("chcp 65001 >NUL & ")
                 .unwrap_or(raw)
                 .to_string()
+        } else if is_pwsh(&self.program) {
+            // powershell.exe / pwsh last arg is the -Command script block
+            self.args.last().cloned().unwrap_or_else(|| {
+                let mut parts = vec![self.program.clone()];
+                parts.extend(self.args.clone());
+                parts.join(" ")
+            })
         } else {
-            // For other commands, join program and args
             let mut parts = vec![self.program.clone()];
             parts.extend(self.args.clone());
             parts.join(" ")

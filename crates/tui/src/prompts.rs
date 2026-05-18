@@ -100,6 +100,28 @@ fn render_environment_block(workspace: &Path, locale_tag: &str) -> String {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string());
     let pwd = workspace.display();
 
+    // Build a comma-separated list of available shells for the `exec_shell`
+    // tool. Every platform has `sh`; `bash`/`zsh` are Unix-specific;
+    // `cmd` and `powershell` are Windows-specific.
+    let available_shells = {
+        #[cfg(windows)]
+        {
+            "cmd, powershell"
+        }
+        #[cfg(target_os = "macos")]
+        {
+            "sh, bash, zsh"
+        }
+        #[cfg(target_os = "linux")]
+        {
+            "sh, bash, zsh"
+        }
+        #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+        {
+            "sh"
+        }
+    };
+
     format!(
         "## Environment\n\
          \n\
@@ -107,7 +129,13 @@ fn render_environment_block(workspace: &Path, locale_tag: &str) -> String {
          - deepseek_version: {deepseek_version}\n\
          - platform: {platform}\n\
          - shell: {shell}\n\
-         - pwd: {pwd}"
+         - pwd: {pwd}\n\
+         - available_shells: {available_shells}\n\
+         \n\
+         The `exec_shell` tool accepts an optional `shell` parameter. \
+         On this platform the default is `sh` (Unix) or `cmd` (Windows). \
+         Choose from the `available_shells` list when the command needs \
+         a specific shell dialect."
     )
 }
 
@@ -816,6 +844,8 @@ mod tests {
         assert!(block.contains(&format!("- pwd: {}", tmp.path().display())));
         assert!(block.contains("- platform:"));
         assert!(block.contains("- shell:"));
+        assert!(block.contains("- available_shells:"));
+        assert!(block.contains("exec_shell tool accepts an optional `shell` parameter"));
     }
 
     #[test]

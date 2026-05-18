@@ -32,6 +32,7 @@ use crate::sandbox::{
     SandboxManager,
     SandboxPolicy as ExecutionSandboxPolicy, // Rename to avoid conflict with spec::SandboxPolicy
     SandboxType,
+    ShellKind,
 };
 
 /// Status of a shell process
@@ -681,6 +682,34 @@ impl ShellManager {
         policy_override: Option<ExecutionSandboxPolicy>,
         extra_env: HashMap<String, String>,
     ) -> Result<ShellResult> {
+        self.execute_with_options_env_shell(
+            command,
+            working_dir,
+            timeout_ms,
+            background,
+            stdin_data,
+            tty,
+            policy_override,
+            extra_env,
+            ShellKind::Auto,
+        )
+    }
+
+    /// Like `execute_with_options_env`, but with an explicit
+    /// [`ShellKind`] that overrides the platform default.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_with_options_env_shell(
+        &mut self,
+        command: &str,
+        working_dir: Option<&str>,
+        timeout_ms: u64,
+        background: bool,
+        stdin_data: Option<&str>,
+        tty: bool,
+        policy_override: Option<ExecutionSandboxPolicy>,
+        extra_env: HashMap<String, String>,
+        shell_kind: ShellKind,
+    ) -> Result<ShellResult> {
         let work_dir = working_dir.map_or_else(|| self.default_workspace.clone(), PathBuf::from);
 
         // Clamp timeout to max 10 minutes (600000ms)
@@ -690,9 +719,14 @@ impl ShellManager {
         let policy = policy_override.unwrap_or_else(|| self.sandbox_policy.clone());
 
         // Create command spec and prepare sandboxed environment
-        let spec = CommandSpec::shell(command, work_dir.clone(), Duration::from_millis(timeout_ms))
-            .with_policy(policy)
-            .with_env(extra_env);
+        let spec = CommandSpec::shell_with_kind(
+            command,
+            work_dir.clone(),
+            Duration::from_millis(timeout_ms),
+            shell_kind,
+        )
+        .with_policy(policy)
+        .with_env(extra_env);
         let exec_env = self.sandbox_manager.prepare(&spec);
 
         if background {
@@ -744,14 +778,41 @@ impl ShellManager {
         policy_override: Option<ExecutionSandboxPolicy>,
         extra_env: HashMap<String, String>,
     ) -> Result<ShellResult> {
+        self.execute_interactive_with_policy_env_shell(
+            command,
+            working_dir,
+            timeout_ms,
+            policy_override,
+            extra_env,
+            ShellKind::Auto,
+        )
+    }
+
+    /// Like `execute_interactive_with_policy_env` with an explicit
+    /// [`ShellKind`] override.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_interactive_with_policy_env_shell(
+        &mut self,
+        command: &str,
+        working_dir: Option<&str>,
+        timeout_ms: u64,
+        policy_override: Option<ExecutionSandboxPolicy>,
+        extra_env: HashMap<String, String>,
+        shell_kind: ShellKind,
+    ) -> Result<ShellResult> {
         let work_dir = working_dir.map_or_else(|| self.default_workspace.clone(), PathBuf::from);
 
         let timeout_ms = timeout_ms.clamp(1000, 600_000);
         let policy = policy_override.unwrap_or_else(|| self.sandbox_policy.clone());
 
-        let spec = CommandSpec::shell(command, work_dir.clone(), Duration::from_millis(timeout_ms))
-            .with_policy(policy)
-            .with_env(extra_env);
+        let spec = CommandSpec::shell_with_kind(
+            command,
+            work_dir.clone(),
+            Duration::from_millis(timeout_ms),
+            shell_kind,
+        )
+        .with_policy(policy)
+        .with_env(extra_env);
         let exec_env = self.sandbox_manager.prepare(&spec);
 
         Self::execute_interactive_sandboxed(command, &work_dir, timeout_ms, &exec_env)
@@ -1592,6 +1653,7 @@ async fn execute_foreground_via_background(
     tty: bool,
     policy_override: Option<ExecutionSandboxPolicy>,
     extra_env: HashMap<String, String>,
+    shell_kind: ShellKind,
 ) -> Result<ShellResult> {
     let timeout_ms = timeout_ms.clamp(1000, 600_000);
     let spawned = {
@@ -1600,7 +1662,7 @@ async fn execute_foreground_via_background(
             .lock()
             .map_err(|_| anyhow!("shell manager lock poisoned"))?;
         manager.clear_foreground_background_request();
-        manager.execute_with_options_env(
+        manager.execute_with_options_env_shell(
             command,
             None,
             timeout_ms,
@@ -1609,6 +1671,7 @@ async fn execute_foreground_via_background(
             tty,
             policy_override,
             extra_env,
+            shell_kind,
         )?
     };
     let task_id = spawned
@@ -1687,6 +1750,11 @@ impl ToolSpec for ExecShellTool {
                     "type": "string",
                     "description": "The shell command to execute"
                 },
+                "shell": {
+                    "type": "string",
+                    "enum": ["auto", "sh", "bash", "zsh", "cmd", "powershell", "pwsh"],
+                    "description": "Shell used to interpret command (default: auto). On Windows the default is cmd; on Unix the default is sh. Use powershell or pwsh on Windows for modern PowerShell syntax, bash/zsh on Unix for interactive login shells."
+                },
                 "timeout_ms": {
                     "type": "integer",
                     "description": "Timeout in milliseconds (default: 120000, max: 600000)"
@@ -1749,6 +1817,17 @@ impl ToolSpec for ExecShellTool {
             .or_else(|| input.get("data"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+
+        // Parse optional shell kind, defaulting to Auto (platform default).
+        let shell_kind: ShellKind = match input.get("shell").and_then(serde_json::Value::as_str) {
+            Some("sh") => ShellKind::Sh,
+            Some("bash") => ShellKind::Bash,
+            Some("zsh") => ShellKind::Zsh,
+            Some("cmd") => ShellKind::Cmd,
+            Some("powershell") => ShellKind::Powershell,
+            Some("pwsh") => ShellKind::Pwsh,
+            _ => ShellKind::Auto,
+        };
 
         if interactive && background {
             return Ok(ToolResult::error(
@@ -1950,19 +2029,20 @@ impl ToolSpec for ExecShellTool {
                 .shell_manager
                 .lock()
                 .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
-            manager.execute_interactive_with_policy_env(
+            manager.execute_interactive_with_policy_env_shell(
                 command,
                 working_dir.as_deref(),
                 timeout_ms,
                 policy_override,
                 extra_env,
+                shell_kind,
             )
         } else if background {
             let mut manager = context
                 .shell_manager
                 .lock()
                 .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
-            manager.execute_with_options_env(
+            manager.execute_with_options_env_shell(
                 command,
                 working_dir.as_deref(),
                 timeout_ms,
@@ -1971,6 +2051,7 @@ impl ToolSpec for ExecShellTool {
                 tty,
                 policy_override,
                 extra_env,
+                shell_kind,
             )
         } else {
             execute_foreground_via_background(
@@ -1981,6 +2062,7 @@ impl ToolSpec for ExecShellTool {
                 combined_output,
                 policy_override,
                 extra_env,
+                shell_kind,
             )
             .await
         };
